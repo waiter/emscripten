@@ -41,6 +41,7 @@ struct Branch {
   void Render(Block *Target, bool SetLabel);
 };
 
+typedef std::set<Block*> BlockSet;
 typedef std::map<Block*, Branch*> BlockBranchMap;
 
 // Represents a basic block of code - some instructions that end with a
@@ -52,9 +53,9 @@ struct Block {
   // processed branches.
   // Blocks own the Branch objects they use, and destroy them when done.
   BlockBranchMap BranchesOut;
-  BlockBranchMap BranchesIn; // TODO: make this just a list of Incoming, without branch info - should be just on BranchesOut
+  BlockSet BranchesIn;
   BlockBranchMap ProcessedBranchesOut;
-  BlockBranchMap ProcessedBranchesIn;
+  BlockSet ProcessedBranchesIn;
   Shape *Parent; // The shape we are directly inside
   int Id; // A unique identifier
   const char *Code; // The string representation of the code in this block. Owning pointer (we copy the input)
@@ -100,6 +101,7 @@ class LoopShape;
 struct Shape {
   int Id; // A unique identifier. Used to identify loops, labels are Lx where x is the Id.
   Shape *Next; // The shape that will appear in the code right after this one
+  Shape *Natural; // The shape that control flow gets to naturally (if there is Next, then this is Next)
 
   enum ShapeType {
     Simple,
@@ -205,12 +207,12 @@ struct Relooper {
   static void SetAsmJSMode(int On);
 };
 
-typedef std::set<Block*> BlockSet;
 typedef std::map<Block*, BlockSet> BlockBlockSetMap;
 
 #if DEBUG
 struct Debugging {
   static void Dump(BlockSet &Blocks, const char *prefix=NULL);
+  static void Dump(Shape *S, const char *prefix=NULL);
 };
 #endif
 
