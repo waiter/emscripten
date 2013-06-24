@@ -28,34 +28,6 @@ Example uses:
    so it should relay everything to gcc/g++. You should not define that when
    running make, of course.
 
- * With CMake, the same command will work (with cmake instead of ./configure). You may also be
-   able to do the following in your CMakeLists.txt:
-
-    SET(CMAKE_C_COMPILER "PATH/emcc")
-    SET(CMAKE_CXX_COMPILER "PATH/em++")
-    SET(CMAKE_LINKER "PATH/emcc")
-    SET(CMAKE_CXX_LINKER "PATH/emcc")
-    SET(CMAKE_C_LINK_EXECUTABLE "PATH/emcc")
-    SET(CMAKE_CXX_LINK_EXECUTABLE "PATH/emcc")
-    SET(CMAKE_AR "PATH/emar")
-    SET(CMAKE_RANLIB "PATH/emranlib")
-
- * For SCons the shared.py can be imported like so:
-    __file__ = str(Dir('#/project_path_to_emscripten/dummy/dummy'))
-    __rootpath__ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    def path_from_root(*pathelems):
-      return os.path.join(__rootpath__, *pathelems)
-    sys.path += [path_from_root('')]
-    from tools.shared import *
-
-   For using the Emscripten compilers/linkers/etc. you can do:
-    env = Environment()
-    ...
-    env.Append(CCFLAGS = COMPILER_OPTS)
-    env.Replace(LINK = LLVM_LD)
-    env.Replace(LD   = LLVM_LD)
-   TODO: Document all relevant setup changes
-
 After setting that up, run your build system normally.
 
 Note the appearance of em++ instead of emcc
@@ -80,8 +52,6 @@ from subprocess import PIPE, STDOUT
 from tools import shared
 from tools.shared import Compression, execute, suffix, unsuffixed, unsuffixed_basename
 from tools.response_file import read_response_file
-
-logging = logging.getLogger('emcc')
 
 # Mapping of emcc opt levels to llvm opt levels. We use llvm opt level 3 in emcc opt
 # levels 2 and 3 (emcc 3 is unsafe opts, so unsuitable for the only level to get
@@ -138,7 +108,7 @@ while response_file:
       sys.argv[index:index+1] = extra_args
       break
 
-if len(sys.argv) == 1 or sys.argv[1] == '--help':
+if len(sys.argv) == 1 or '--help' in sys.argv:
   this = os.path.basename('em++' if os.environ.get('EMMAKEN_CXX') else 'emcc')
 
   print '''%s [options] file...
@@ -245,6 +215,11 @@ Options that are modified or new in %s include:
                            occur). Note that it takes time to run, and
                            may require some changes to the code. This
                            is run by default in -O3.
+
+                           In asm.js mode, closure will only be used on the
+                           'shell' code around the compiled code (the
+                           compiled code will be processed by the custom
+                           asm.js minifier).
 
                            Note: If closure compiler hits an out-of-memory,
                            try adjusting JAVA_HEAP_SIZE in the environment
@@ -562,7 +537,7 @@ if CONFIGURE_CONFIG or CMAKE_CONFIG:
         skip_next = False
         idx += 1
         continue
-      if el == '-s' and is_minus_s_for_emcc(argv, idx):
+      if not use_js and el == '-s' and is_minus_s_for_emcc(argv, idx): # skip -s X=Y if not using js for configure
         skip_next = True
       else:
         yield el
@@ -624,7 +599,7 @@ if EMMAKEN_CFLAGS: CC_ADDITIONAL_ARGS += shlex.split(EMMAKEN_CFLAGS)
 
 # ---------------- Utilities ---------------
 
-SOURCE_SUFFIXES = ('.c', '.cpp', '.cxx', '.cc')
+SOURCE_SUFFIXES = ('.c', '.cpp', '.cxx', '.cc', '.m', '.mm')
 BITCODE_SUFFIXES = ('.bc', '.o', '.obj')
 DYNAMICLIB_SUFFIXES = ('.dylib', '.so', '.dll')
 STATICLIB_SUFFIXES = ('.a',)
@@ -652,7 +627,7 @@ header = False # pre-compiled headers. We fake that by just copying the file
 for i in range(1, len(sys.argv)):
   arg = sys.argv[i]
   if not arg.startswith('-'):
-    if arg.endswith('.c'):
+    if arg.endswith(('.c','.m')):
       use_cxx = False
     if arg.endswith('.h') and sys.argv[i-1] != '-include':
       header = True
@@ -842,8 +817,12 @@ try:
       newargs[i] = ''
     elif newargs[i] == '-v':
       shared.COMPILER_OPTS += ['-v']
-      DEBUG = 1
       os.environ['EMCC_DEBUG'] = '1' # send to child processes too
+      if DEBUG != 1:
+        # swap in debug logging
+        DEBUG = 1
+        shared.set_logging()
+        logging.debug('invocation: ' + ' '.join(sys.argv))
       newargs[i] = ''
     elif newargs[i].startswith('--shell-file'):
       check_bad_eq(newargs[i])
@@ -876,9 +855,10 @@ try:
       memory_init_file = int(newargs[i+1])
       newargs[i] = ''
       newargs[i+1] = ''
-    elif newargs[i].startswith(('-I/', '-L/')):
-      if not absolute_warning_shown:
-        logging.warning ('-I or -L of an absolute path encountered. If this is to a local system header/library, it may cause problems (local system files make sense for compiling natively on your system, but not necessarily to JavaScript)') # Of course an absolute path to a non-system-specific library or header is fine, and you can ignore this warning. The danger are system headers that are e.g. x86 specific and nonportable. The emscripten bundled headers are modified to be portable, local system ones are generally not
+    elif newargs[i].startswith(('-I', '-L')):
+      path_name = newargs[i][2:]
+      if not absolute_warning_shown and os.path.isabs(path_name):
+        logging.warning ('-I or -L of an absolute path "' + newargs[i] + '" encountered. If this is to a local system header/library, it may cause problems (local system files make sense for compiling natively on your system, but not necessarily to JavaScript)') # Of course an absolute path to a non-system-specific library or header is fine, and you can ignore this warning. The danger are system headers that are e.g. x86 specific and nonportable. The emscripten bundled headers are modified to be portable, local system ones are generally not
         absolute_warning_shown = True
   newargs = [ arg for arg in newargs if arg is not '' ]
 
@@ -925,7 +905,10 @@ try:
 
     if i > 0:
       prev = newargs[i-1]
-      if prev in ['-MT', '-install_name', '-I', '-L']: continue # ignore this gcc-style argument
+      if prev in ['-MT', '-MF', '-MQ', '-D', '-U', '-o', '-x', '-Xpreprocessor', '-include', '-imacros', '-idirafter', '-iprefix', '-iwithprefix', '-iwithprefixbefore', '-isysroot', '-imultilib', '-A', '-isystem', '-iquote', '-install_name', '-I', '-L']: continue # ignore this gcc-style argument
+
+    if (os.path.islink(arg) and os.path.realpath(arg).endswith(SOURCE_SUFFIXES + BITCODE_SUFFIXES + DYNAMICLIB_SUFFIXES + ASSEMBLY_SUFFIXES)):
+      arg = os.path.realpath(arg)
 
     if not arg.startswith('-') and (arg.endswith(SOURCE_SUFFIXES + BITCODE_SUFFIXES + DYNAMICLIB_SUFFIXES + ASSEMBLY_SUFFIXES) or shared.Building.is_ar(arg)): # we already removed -o <target>, so all these should be inputs
       newargs[i] = ''
@@ -1014,7 +997,8 @@ try:
   for change in settings_changes:
     key, value = change.split('=')
     if value[0] == '@':
-      value = '"' + value + '"'
+      value = '"@' + os.path.abspath(value[1:]) + '"'
+      value = value.replace('\\\\', '/').replace('\\', '/') # Convert backslash paths to forward slashes on Windows as well, since the JS compiler otherwise needs the backslashes escaped (alternative is to escape all input paths passing to JS, which feels clumsier to read)
     exec('shared.Settings.' + key + ' = ' + value)
 
   # Apply effects from settings
@@ -1022,11 +1006,7 @@ try:
     assert opt_level >= 1, 'asm.js requires -O1 or above'
 
     if bind:
-      shared.Settings.ASM_JS = 0
-      logging.warning('disabling asm.js because it is not compatible with embind yet')
-    if closure:
-      logging.warning('disabling closure because it is not compatible with asm.js code generation')
-      closure = False
+      shared.Settings.RESERVED_FUNCTION_POINTERS = max(shared.Settings.RESERVED_FUNCTION_POINTERS, 10)
     if shared.Settings.CORRECT_SIGNS != 1:
       logging.warning('setting CORRECT_SIGNS to 1 for asm.js code generation')
       shared.Settings.CORRECT_SIGNS = 1
@@ -1044,8 +1024,6 @@ try:
   if (keep_llvm_debug or keep_js_debug) and closure:
     logging.warning('disabling closure because debug info was requested')
     closure = False
-
-  if jcache and not keep_js_debug: print >> sys.stderr, 'emcc: warning: it is recommended to run jcache with -g when compiling bitcode to JS'
 
   if minify_whitespace is None:
     minify_whitespace = opt_level >= 2 and not keep_js_debug
@@ -1549,7 +1527,7 @@ try:
     if shared.Settings.RELOOP and not shared.Settings.ASM_JS:
       js_optimizer_queue += ['optimizeShiftsAggressive', get_eliminate()] # aggressive shifts optimization requires loops, it breaks on switches
 
-  if closure:
+  if closure and not shared.Settings.ASM_JS:
     flush_js_optimizer_queue()
 
     logging.debug('running closure')
@@ -1560,12 +1538,15 @@ try:
     logging.debug('running post-closure post-opts')
     js_optimizer_queue += ['simplifyExpressionsPost']
 
-  if not closure and shared.Settings.RELOOP and not keep_js_debug:
+  if (not closure or shared.Settings.ASM_JS) and shared.Settings.RELOOP and not keep_js_debug:
     # do this if closure is not enabled (it gives similar speedups), and we do not need to keep debug info around
     js_optimizer_queue += ['registerize']
 
   if minify_whitespace:
     js_optimizer_queue += ['compress']
+
+  if closure and shared.Settings.ASM_JS: 
+    js_optimizer_queue += ['closure']
 
   js_optimizer_queue += ['last']
 

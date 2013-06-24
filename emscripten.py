@@ -127,6 +127,9 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
   if DEBUG and len(meta) > 1024*1024: print >> sys.stderr, 'emscript warning: large amounts of metadata, will slow things down'
   if DEBUG: print >> sys.stderr, '  emscript: split took %s seconds' % (time.time() - t)
 
+  if len(funcs) == 0:
+    print >> sys.stderr, 'No functions to process. Make sure you prevented LLVM from eliminating them as dead (use EXPORTED_FUNCTIONS if necessary, see the FAQ)'
+
   #if DEBUG:
   #  print >> sys.stderr, '========= pre ================\n'
   #  print >> sys.stderr, ''.join(pre)
@@ -404,7 +407,7 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
     math_envs = ['Math.min'] # TODO: move min to maths
     asm_setup += '\n'.join(['var %s = %s;' % (f.replace('.', '_'), f) for f in math_envs])
 
-    basic_funcs = ['abort', 'assert', 'asmPrintInt', 'asmPrintFloat', 'copyTempDouble', 'copyTempFloat'] + [m.replace('.', '_') for m in math_envs]
+    basic_funcs = ['abort', 'assert', 'asmPrintInt', 'asmPrintFloat'] + [m.replace('.', '_') for m in math_envs]
     if settings['RESERVED_FUNCTION_POINTERS'] > 0: basic_funcs.append('jsCall')
     if settings['SAFE_HEAP']: basic_funcs += ['SAFE_HEAP_LOAD', 'SAFE_HEAP_STORE', 'SAFE_HEAP_CLEAR']
     if settings['CHECK_HEAP_ALIGN']: basic_funcs += ['CHECK_ALIGN_2', 'CHECK_ALIGN_4', 'CHECK_ALIGN_8']
@@ -456,10 +459,10 @@ def emscript(infile, settings, outfile, libraries=[], compiler_engine=None,
       asm_setup += '''
 function invoke_%s(%s) {
   try {
-    %sModule.dynCall_%s(%s);
+    %sModule["dynCall_%s"](%s);
   } catch(e) {
     if (typeof e !== 'number' && e !== 'longjmp') throw e;
-    asm.setThrew(1, 0);
+    asm["setThrew"](1, 0);
   }
 }
 ''' % (sig, args, 'return ' if sig[0] != 'v' else '', sig, args)
@@ -489,11 +492,11 @@ function invoke_%s(%s) {
     asm_global_vars = ''.join(['  var ' + g + '=env.' + g + '|0;\n' for g in basic_vars + global_vars]) + \
                       ''.join(['  var ' + g + '=+env.' + g + ';\n' for g in basic_float_vars])
     # sent data
-    the_global = '{ ' + ', '.join([math_fix(s) + ': ' + s for s in fundamentals]) + ' }'
-    sending = '{ ' + ', '.join([math_fix(s) + ': ' + s for s in basic_funcs + global_funcs + basic_vars + basic_float_vars + global_vars]) + ' }'
+    the_global = '{ ' + ', '.join(['"' + math_fix(s) + '": ' + s for s in fundamentals]) + ' }'
+    sending = '{ ' + ', '.join(['"' + math_fix(s) + '": ' + s for s in basic_funcs + global_funcs + basic_vars + basic_float_vars + global_vars]) + ' }'
     # received
     if not simple:
-      receiving = ';\n'.join(['var ' + s + ' = Module["' + s + '"] = asm.' + s for s in exported_implemented_functions + function_tables])
+      receiving = ';\n'.join(['var ' + s + ' = Module["' + s + '"] = asm["' + s + '"]' for s in exported_implemented_functions + function_tables])
     else:
       receiving = 'var _main = Module["_main"] = asm;'
 
@@ -552,6 +555,24 @@ var asm = (function(global, env, buffer) {
       threwValue = value;
     }
   }
+  function copyTempFloat(ptr) {
+    ptr = ptr|0;
+    HEAP8[tempDoublePtr] = HEAP8[ptr];
+    HEAP8[tempDoublePtr+1|0] = HEAP8[ptr+1|0];
+    HEAP8[tempDoublePtr+2|0] = HEAP8[ptr+2|0];
+    HEAP8[tempDoublePtr+3|0] = HEAP8[ptr+3|0];
+  }
+  function copyTempDouble(ptr) {
+    ptr = ptr|0;
+    HEAP8[tempDoublePtr] = HEAP8[ptr];
+    HEAP8[tempDoublePtr+1|0] = HEAP8[ptr+1|0];
+    HEAP8[tempDoublePtr+2|0] = HEAP8[ptr+2|0];
+    HEAP8[tempDoublePtr+3|0] = HEAP8[ptr+3|0];
+    HEAP8[tempDoublePtr+4|0] = HEAP8[ptr+4|0];
+    HEAP8[tempDoublePtr+5|0] = HEAP8[ptr+5|0];
+    HEAP8[tempDoublePtr+6|0] = HEAP8[ptr+6|0];
+    HEAP8[tempDoublePtr+7|0] = HEAP8[ptr+7|0];
+  }
 ''' + ''.join(['''
   function setTempRet%d(value) {
     value = value|0;
@@ -565,9 +586,9 @@ var asm = (function(global, env, buffer) {
 // EMSCRIPTEN_END_ASM
 (%s, %s, buffer);
 %s;
-Runtime.stackAlloc = function(size) { return asm.stackAlloc(size) };
-Runtime.stackSave = function() { return asm.stackSave() };
-Runtime.stackRestore = function(top) { asm.stackRestore(top) };
+Runtime.stackAlloc = function(size) { return asm['stackAlloc'](size) };
+Runtime.stackSave = function() { return asm['stackSave']() };
+Runtime.stackRestore = function(top) { asm['stackRestore'](top) };
 ''' % (pre_tables + '\n'.join(function_tables_impls) + '\n' + function_tables_defs.replace('\n', '\n  '), exports, the_global, sending, receiving)]
 
     # Set function table masks

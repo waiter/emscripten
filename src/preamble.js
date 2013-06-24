@@ -231,7 +231,7 @@ var setjmpId = 1; // Used in setjmp/longjmp
 var setjmpLabels = {};
 #endif
 
-var ABORT = false;
+var ABORT = false; // whether we are quitting the application. no code should run after this. set in exit() and abort()
 
 var undef = 0;
 // tempInt is used for 32-bit signed values or smaller. tempBigInt is used
@@ -475,7 +475,11 @@ function allocate(slab, types, allocator, ptr) {
 
 #if USE_TYPED_ARRAYS == 2
   if (singleType === 'i8') {
-    HEAPU8.set(new Uint8Array(slab), ret);
+    if (slab.subarray || slab.slice) {
+      HEAPU8.set(slab, ret);
+    } else {
+      HEAPU8.set(new Uint8Array(slab), ret);
+    }
     return ret;
   }
 #endif
@@ -777,7 +781,7 @@ Module['writeArrayToMemory'] = writeArrayToMemory;
 {{{ reSign }}}
 
 #if PRECISE_I32_MUL
-if (!Math.imul) Math.imul = function(a, b) {
+if (!Math['imul']) Math['imul'] = function(a, b) {
   var ah  = a >>> 16;
   var al = a & 0xffff;
   var bh  = b >>> 16;
@@ -785,7 +789,7 @@ if (!Math.imul) Math.imul = function(a, b) {
   return (al*bl + ((ah*bl + al*bh) << 16))|0;
 };
 #else
-Math.imul = function(a, b) {
+Math['imul'] = function(a, b) {
   return (a*b)|0; // fast but imprecise
 };
 #endif
@@ -809,6 +813,7 @@ function addRunDependency(id) {
   if (id) {
     assert(!runDependencyTracking[id]);
     runDependencyTracking[id] = 1;
+#if ASSERTIONS
     if (runDependencyWatcher === null && typeof setInterval !== 'undefined') {
       // Check for missing dependencies every few seconds
       runDependencyWatcher = setInterval(function() {
@@ -823,8 +828,9 @@ function addRunDependency(id) {
         if (shown) {
           Module.printErr('(end of list)');
         }
-      }, 6000);
+      }, 10000);
     }
+#endif
   } else {
     Module.printErr('warning: run dependency added without ID');
   }
@@ -873,6 +879,7 @@ var PGOMonitor = {
     Module.print('-s DEAD_FUNCTIONS=\'' + JSON.stringify(dead) + '\'\n');
   }
 };
+Module['PGOMonitor'] = PGOMonitor;
 __ATEXIT__.push({ func: function() { PGOMonitor.dump() } });
 addPreRun(function() { addRunDependency('pgo') });
 #endif

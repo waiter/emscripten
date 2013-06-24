@@ -1,7 +1,7 @@
 
 // === Auto-generated postamble setup entry stuff ===
 
-Module.callMain = function callMain(args) {
+Module['callMain'] = function callMain(args) {
   assert(runDependencies == 0, 'cannot call main when async dependencies remain! (listen on __ATMAIN__)');
   assert(!Module['preRun'] || Module['preRun'].length == 0, 'cannot call main when preRun functions remain to be called');
 
@@ -84,7 +84,7 @@ function run(args) {
     var ret = 0;
     calledRun = true;
     if (Module['_main'] && shouldRunNow) {
-      ret = Module.callMain(args);
+      ret = Module['callMain'](args);
       if (!Module['noExitRuntime']) {
         exitRuntime();
       }
@@ -104,7 +104,7 @@ function run(args) {
       setTimeout(function() {
         Module['setStatus']('');
       }, 1);
-      doRun();
+      if (!ABORT) doRun();
     }, 1);
     return 0;
   } else {

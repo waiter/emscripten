@@ -12,6 +12,8 @@ var RELOOP_IGNORED_LASTS = set('return', 'unreachable', 'resume');
 var addedLibraryItems = {};
 var asmLibraryFunctions = [];
 
+var SETJMP_LABEL = -1;
+
 // JSifier
 function JSify(data, functionsOnly, givenFunctions) {
   var mainPass = !functionsOnly;
@@ -326,7 +328,7 @@ function JSify(data, functionsOnly, givenFunctions) {
       var js = (index !== null ? '' : item.ident + '=') + constant;
       if (js) js += ';';
 
-      if (!ASM_JS && (EXPORT_ALL || (item.ident in EXPORTED_GLOBALS))) {
+      if (!ASM_JS && NAMED_GLOBALS && (EXPORT_ALL || (item.ident in EXPORTED_GLOBALS))) {
         js += '\nModule["' + item.ident + '"] = ' + item.ident + ';';
       }
       if (BUILD_AS_SHARED_LIB == 2 && !item.private_) {
@@ -458,6 +460,7 @@ function JSify(data, functionsOnly, givenFunctions) {
         } else {
           ident = '_' + ident;
         }
+        if (VERBOSE) printErr('adding ' + ident + ' and deps ' + deps);
         var depsText = (deps ? '\n' + deps.map(addFromLibrary).filter(function(x) { return x != '' }).join('\n') : '');
         var contentText = isFunction ? snippet : ('var ' + ident + '=' + snippet + ';');
         if (ASM_JS) {
@@ -730,7 +733,7 @@ function JSify(data, functionsOnly, givenFunctions) {
             }).join('\n') + '\n';
             if (func.setjmpTable && ASM_JS) {
               // emit a label in which we write to the proper local variable, before jumping to the actual label
-              ret += '  case -1111: ';
+              ret += '  case ' + SETJMP_LABEL + ': ';
               ret += func.setjmpTable.map(function(triple) { // original label, label we created for right after the setjmp, variable setjmp result goes into
                 return 'if ((setjmpLabel|0) == ' + getLabelId(triple.oldLabel) + ') { ' + triple.assignTo + ' = threwValue; label = ' + triple.newLabel + ' }\n';
               }).join(' else ');
@@ -1030,13 +1033,13 @@ function JSify(data, functionsOnly, givenFunctions) {
       }
       for (var i = 0; i < idents.length; i++) {
         if (keys(deps[idents[i]]).length == 0) {
-          pre = 'var ' + idents[i] + ' = ' + valueJSes[idents[i]] + ';' + pre;
+          post = 'var ' + idents[i] + ' = ' + valueJSes[idents[i]] + ';' + post;
           remove(idents[i]);
           continue mainLoop;
         }
       }
       // If we got here, we have circular dependencies, and must break at least one.
-      pre = 'var ' + idents[0] + '$phi = ' + valueJSes[idents[0]] + ';' + pre;
+      pre += 'var ' + idents[0] + '$phi = ' + valueJSes[idents[0]] + ';';
       post += 'var ' + idents[0] + ' = ' + idents[0] + '$phi;';
       remove(idents[0]);
     }
@@ -1160,6 +1163,7 @@ function JSify(data, functionsOnly, givenFunctions) {
     return ret + ';';
   });
   makeFuncLineActor('resume', function(item) {
+    if (DISABLE_EXCEPTION_CATCHING) return 'abort()';
     if (item.ident == 0) {
       // No exception to resume, so we can just bail.
       // This is related to issue #917 and http://llvm.org/PR15518
@@ -1181,7 +1185,13 @@ function JSify(data, functionsOnly, givenFunctions) {
     if (disabled) {
       ret = call_ + ';';
     } else if (ASM_JS) {
-      ret = '(__THREW__ = 0,' +  call_ + ');';
+      if (item.type != 'void') call_ = asmCoercion(call_, item.type); // ensure coercion to ffi in comma operator
+      call_ = call_.replace('; return', ''); // we auto-add returns when aborting, but do not need them here
+      if (item.type == 'void') {
+        ret = '__THREW__ = 0;' +  call_ + ';';
+      } else {
+        ret = '(__THREW__ = 0,' +  call_ + ');';
+      }
     } else {
       ret = '(function() { try { __THREW__ = 0; return '
           + call_ + ' '
@@ -1305,8 +1315,10 @@ function JSify(data, functionsOnly, givenFunctions) {
     assert(TARGET_LE32);
     var ident = item.value.ident;
     var move = Runtime.STACK_ALIGN;
-    return '(tempInt=' + makeGetValue(ident, 4, '*') + ',' +
-                         makeSetValue(ident, 4, 'tempInt + ' + move, '*') + ',' +
+    
+    // store current list offset in tempInt, advance list offset by STACK_ALIGN, return list entry stored at tempInt
+    return '(tempInt=' + makeGetValue(ident, Runtime.QUANTUM_SIZE, '*') + ',' +
+                         makeSetValue(ident, Runtime.QUANTUM_SIZE, 'tempInt + ' + move, '*') + ',' +
                          makeGetValue(makeGetValue(ident, 0, '*'), 'tempInt', item.type) + ')';
   });
 
@@ -1356,7 +1368,7 @@ function JSify(data, functionsOnly, givenFunctions) {
     var ignoreFunctionIndexizing = [];
     var useJSArgs = (simpleIdent + '__jsargs') in LibraryManager.library;
     var hasVarArgs = isVarArgsFunctionType(type);
-    var normalArgs = (hasVarArgs && !useJSArgs) ? countNormalArgs(type) : -1;
+    var normalArgs = (hasVarArgs && !useJSArgs) ? countNormalArgs(type, null, true) : -1;
     var byPointer = getVarData(funcData, ident);
     var byPointerForced = false;
 
@@ -1487,9 +1499,9 @@ function JSify(data, functionsOnly, givenFunctions) {
     }
 
     if (ASM_JS && funcData.setjmpTable) {
-      // check if a longjmp was done. If a setjmp happened, check if ours. If ours, go to -111 to handle it.
+      // check if a longjmp was done. If a setjmp happened, check if ours. If ours, go to a special label to handle it.
       // otherwise, just return - the call to us must also have been an invoke, so the setjmp propagates that way
-      ret += '; if (((__THREW__|0) != 0) & ((threwValue|0) > 0)) { setjmpLabel = ' + asmCoercion('_testSetjmp(' + makeGetValue('__THREW__', 0, 'i32') + ', setjmpTable)', 'i32') + '; if ((setjmpLabel|0) > 0) { label = -1111; break } else return ' + (funcData.returnType != 'void' ? asmCoercion('0', funcData.returnType) : '') + ' } __THREW__ = threwValue = 0;\n';
+      ret += '; if (((__THREW__|0) != 0) & ((threwValue|0) != 0)) { setjmpLabel = ' + asmCoercion('_testSetjmp(' + makeGetValue('__THREW__', 0, 'i32') + ', setjmpTable)', 'i32') + '; if ((setjmpLabel|0) > 0) { label = ' + SETJMP_LABEL + '; break } else return ' + (funcData.returnType != 'void' ? asmCoercion('0', funcData.returnType) : '') + ' } __THREW__ = threwValue = 0;\n';
     }
 
     return ret;

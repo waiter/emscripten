@@ -129,9 +129,13 @@ function isPointerType(type) {
   return type[type.length-1] == '*';
 }
 
+function isArrayType(type) {
+  return /^\[\d+\ x\ (.*)\]/.test(type);
+}
+
 function isStructType(type) {
   if (isPointerType(type)) return false;
-  if (/^\[\d+\ x\ (.*)\]/.test(type)) return true; // [15 x ?] blocks. Like structs
+  if (isArrayType(type)) return true;
   if (/<?{ ?[^}]* ?}>?/.test(type)) return true; // { i32, i8 } etc. - anonymous struct types
   // See comment in isStructPointerType()
   return type[0] == '%';
@@ -286,11 +290,22 @@ function isVarArgsFunctionType(type) {
   return type.substr(-varArgsSuffix.length) == varArgsSuffix;
 }
 
-function countNormalArgs(type, out) {
+function getNumLegalizedVars(type) { // how many legalized variables are needed to represent this type
+  if (type in Runtime.FLOAT_TYPES) return 1;
+  return Math.max(getNumIntChunks(type), 1);
+}
+
+function countNormalArgs(type, out, legalized) {
   out = out || {};
   if (!isFunctionType(type, out)) return -1;
-  if (isVarArgsFunctionType(type)) out.numArgs--;
-  return out.numArgs;
+  var ret = 0;
+  if (out.segments) {
+    for (var i = 0; i < out.segments.length; i++) {
+      ret += legalized ? getNumLegalizedVars(out.segments[i][0].text) : 1;
+    }
+  }
+  if (isVarArgsFunctionType(type)) ret--;
+  return ret;
 }
 
 function addIdent(token) {
@@ -695,9 +710,9 @@ function splitI64(value, floatConversion) {
   var lowInput = legalizedI64s ? value : 'VALUE';
   if (floatConversion && ASM_JS) lowInput = asmFloatToInt(lowInput);
   if (legalizedI64s) {
-    return [lowInput + '>>>0', 'Math.min(Math.floor((' + value + ')/' + asmEnsureFloat(4294967296, 'float') + '), ' + asmEnsureFloat(4294967295, 'float') + ')>>>0'];
+    return [lowInput + '>>>0', asmCoercion('Math.min(' + asmCoercion('Math.floor((' + value + ')/' + asmEnsureFloat(4294967296, 'float') + ')', 'double') + ', ' + asmEnsureFloat(4294967295, 'float') + ')', 'i32') + '>>>0'];
   } else {
-    return makeInlineCalculation(makeI64(lowInput + '>>>0', 'Math.min(Math.floor(VALUE/' + asmEnsureFloat(4294967296, 'float') + '), ' + asmEnsureFloat(4294967295, 'float') + ')>>>0'), value, 'tempBigIntP');
+    return makeInlineCalculation(makeI64(lowInput + '>>>0', asmCoercion('Math.min(' + asmCoercion('Math.floor(VALUE/' + asmEnsureFloat(4294967296, 'float') + ')', 'double') + ', ' + asmEnsureFloat(4294967295, 'float') + ')', 'i32') + '>>>0'), value, 'tempBigIntP');
   }
 }
 function mergeI64(value, unsigned) {
@@ -1034,7 +1049,7 @@ function getHeapOffset(offset, type, forceAsm) {
   offset = '(' + offset + ')';
   if (shifts != 0) {
     if (CHECK_HEAP_ALIGN) {
-      return '(CHECK_ALIGN_' + sz + '(' + offset + '|0)>>' + shifts + ')';
+      return '((CHECK_ALIGN_' + sz + '(' + offset + '|0)|0)>>' + shifts + ')';
     } else {
       return '(' + offset + '>>' + shifts + ')';
     }
@@ -1368,7 +1383,7 @@ function makeCopyValues(dest, src, num, type, modifier, align, sep) {
     if (!isNumber(num)) num = stripCorrections(num);
     if (!isNumber(align)) align = stripCorrections(align);
     if (!isNumber(num) || (parseInt(num)/align >= UNROLL_LOOP_MAX)) {
-      return '_memcpy(' + dest + ', ' + src + ', ' + num + ')';
+      return '(_memcpy(' + dest + ', ' + src + ', ' + num + ')|0)';
     }
     num = parseInt(num);
     if (ASM_JS) {
@@ -1450,7 +1465,7 @@ function getFastValue(a, op, b, type) {
         if ((isNumber(a) && Math.abs(a) < TWO_TWENTY) || (isNumber(b) && Math.abs(b) < TWO_TWENTY) || (bits < 32 && !ASM_JS)) {
           return '(((' + a + ')*(' + b + '))&' + ((Math.pow(2, bits)-1)|0) + ')'; // keep a non-eliminatable coercion directly on this
         }
-        return 'Math.imul(' + a + ',' + b + ')';
+        return '(Math.imul(' + a + ',' + b + ')|0)';
       }
     } else {
       if (a == '0') {
@@ -1743,10 +1758,11 @@ function getGetElementPtrIndexes(item) {
       indexes.push(getFastValue(Runtime.getNativeTypeSize(type), '*', offset, 'i32'));
     }
   }
-  item.params.slice(2, item.params.length).forEach(function(arg) {
+  item.params.slice(2, item.params.length).forEach(function(arg, i) {
     var curr = arg;
     // TODO: If index is constant, optimize
     var typeData = Types.types[type];
+    assert(typeData || i == item.params.length - 3); // can be null, when we get to the end (a basic type)
     if (isStructType(type) && typeData.needsFlattening) {
       if (typeData.flatFactor) {
         indexes.push(getFastValue(curr, '*', typeData.flatFactor, 'i32'));
@@ -1762,16 +1778,15 @@ function getGetElementPtrIndexes(item) {
         indexes.push(curr);
       }
     }
-    if (!isNumber(curr) || parseInt(curr) < 0) {
-      // We have a *variable* to index with, or a negative number. In both
-      // cases, in theory we might need to do something dynamic here. FIXME?
-      // But, most likely all the possible types are the same, so do that case here now...
-      for (var i = 1; i < typeData.fields.length; i++) {
-        assert(typeData.fields[0] === typeData.fields[i]);
+    if (typeData) {
+      if (isArrayType(type)) {
+        type = typeData.fields[0]; // all the same, so accept even out-of-bounds this way
+      } else {
+        assert(isNumber(curr)); // cannot be dynamic
+        type = typeData.fields[curr];
       }
-      curr = 0;
+      assert(type);
     }
-    type = typeData && typeData.fields[curr] ? typeData.fields[curr] : '';
   });
 
   var ret = getFastValues(indexes, '+', 'i32');
@@ -1810,7 +1825,7 @@ function makeStructuralReturn(values, inAsm) {
     var i = -1;
     return 'return ' + asmCoercion(values.slice(1).map(function(value) {
       i++;
-      return ASM_JS ? (inAsm ? 'tempRet' + i + ' = ' + value : 'asm.setTempRet' + i + '(' + value + ')')
+      return ASM_JS ? (inAsm ? 'tempRet' + i + ' = ' + value : 'asm["setTempRet' + i + '"](' + value + ')')
                     : 'tempRet' + i + ' = ' + value;
     }).concat([values[0]]).join(','), 'i32');
   } else {
@@ -2023,12 +2038,20 @@ function processMathop(item) {
   }
   var bitsBefore = parseInt((item.params[0] ? item.params[0].type : item.type).substr(1)); // remove i to leave the number of bits left after this
   var bitsLeft = parseInt(((item.params[1] && item.params[1].ident) ? item.params[1].ident : item.type).substr(1)); // remove i to leave the number of bits left after this operation
+  var rawBits = getBits(item.type);
+  assert(rawBits <= 64);
 
   function integerizeBignum(value) {
     return makeInlineCalculation('VALUE-VALUE%1', value, 'tempBigIntI');
   }
 
-  if ((type == 'i64' || paramTypes[0] == 'i64' || paramTypes[1] == 'i64' || idents[1] == '(i64)') && USE_TYPED_ARRAYS == 2) {
+  if ((type == 'i64' || paramTypes[0] == 'i64' || paramTypes[1] == 'i64' || idents[1] == '(i64)' || rawBits > 32) && USE_TYPED_ARRAYS == 2) {
+    // this code assumes i64 for the most part
+    if (ASSERTIONS && rawBits > 1 && rawBits < 64) {
+      warnOnce('processMathop processing illegal non-i64 value');
+      if (VERBOSE) printErr([op, item.type, rawBits, type, paramTypes, idents]);
+    }
+
     var warnI64_1 = function() {
       warnOnce('Arithmetic on 64-bit integers in mode 1 is rounded and flaky, like mode 0!');
     };
@@ -2181,7 +2204,7 @@ function processMathop(item) {
     case 'sub': return handleOverflow(getFastValue(idents[0], '-', idents[1], item.type), bits);
     case 'sdiv': case 'udiv': return makeRounding(getFastValue(idents[0], '/', idents[1], item.type), bits, op[0] === 's');
     case 'mul': return getFastValue(idents[0], '*', idents[1], item.type); // overflow handling is already done in getFastValue for '*'
-    case 'urem': case 'srem': return getFastValue(idents[0], '%', idents[1], item.type);
+    case 'urem': case 'srem': return makeRounding(getFastValue(idents[0], '%', idents[1], item.type), bits, op[0] === 's');
     case 'or': {
       if (bits > 32) {
         assert(bits === 64, 'Too many bits for or: ' + bits);
